@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cash-collection-a2a"
+version = "1.0.0"
+requires-python = ">=3.11"
+dependencies = [
+    # ── Core LLM / Agent framework ─────────────────────────────────────────
+    "crewai>=0.95.0,<1.8.0",
+    "openai>=1.50.0",
+
+    # ── MCP (Model Context Protocol) ───────────────────────────────────────
+    "fastmcp>=2.0.0",
+
+    # ── MLflow + Databricks ────────────────────────────────────────────────
+    "mlflow>=2.21.0",
+    "databricks-sdk>=0.32.0",
+
+    # ── FastAPI serving ────────────────────────────────────────────────────
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "pydantic>=2.7.0",
+
+    # ── Utilities ──────────────────────────────────────────────────────────
+    "python-dotenv>=1.0.0",
+    "httpx>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "httpx>=0.27.0",
+    "ruff>=0.4.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["crew*", "a2a*", "evaluation*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
