@@ -40,6 +40,13 @@ dev = [
 where = ["."]
 include = ["crew*", "a2a*", "evaluation*"]
 
+[tool.pytest.ini_options]
+# Add project root to sys.path so tests can import top-level modules
+# (crm.py, app.py, mcp_server.py) without a full package install.
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
