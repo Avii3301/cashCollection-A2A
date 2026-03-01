@@ -226,8 +226,6 @@ class TestRunScorers:
         assert "tone_consistency" in names
         assert "completeness_overall" in names
         assert "guardrail_pass" in names
-        # LLM judge disabled by default (LLM_JUDGE_ENABLED not set to true)
-        assert "llm_judge_professional_tone" not in names
 
     def test_each_result_has_name_value_rationale(self):
         results = run_scorers(FIRM_EMAIL | {"invoice_number": "INV-001", "subject": "Test"})

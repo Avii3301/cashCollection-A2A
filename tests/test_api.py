@@ -8,7 +8,7 @@ so these tests run instantly without API keys.
 How the mocking works:
 - 'run_for_invoice' is the function that calls the LLM agents. We replace
   it with a function that returns a hardcoded result instantly.
-- 'run_scorers' and 'log_scores_to_mlflow' are similarly replaced.
+- 'run_scorers' is similarly replaced.
 - MLflow is mocked globally via conftest.py.
 
 The TestClient is created once per module (scope="module") for speed.
@@ -114,9 +114,8 @@ class TestDraftEndpoint:
 
     def _post_draft(self, client, invoices):
         with (
-            patch("app.run_for_invoice", return_value=MOCK_DRAFT_RESULT),
-            patch("app.run_scorers", return_value=MOCK_SCORES),
-            patch("app.log_scores_to_mlflow"),
+            patch("routes.draft.run_for_invoice", return_value=MOCK_DRAFT_RESULT),
+            patch("routes.draft.run_scorers", return_value=MOCK_SCORES),
         ):
             return client.post("/draft", json={"invoices": invoices})
 
@@ -169,8 +168,7 @@ class TestDraftEndpoint:
     def test_crew_error_goes_into_errors_list(self, client):
         """If the crew raises an exception, it ends up in 'errors', not a 500."""
         with (
-            patch("app.run_for_invoice", side_effect=RuntimeError("LLM timeout")),
-            patch("app.log_scores_to_mlflow"),
+            patch("routes.draft.run_for_invoice", side_effect=RuntimeError("LLM timeout")),
         ):
             response = client.post("/draft", json={"invoices": [VALID_INVOICE]})
 

@@ -101,23 +101,35 @@ flowchart TD
 
 ## 4. Component Deep-Dives
 
-### 4.1 `app.py` — FastAPI Application
+### 4.1 Application Layer — Modular Route Structure
 
-The entry point. Responsibilities:
+The application is split across focused modules rather than a single monolithic file:
 
-- Bootstraps MLflow tracking at startup via `lifespan` context manager
-- Validates all incoming requests with Pydantic models
-- Wraps each invoice in a **nested MLflow run** (parent = batch, child = per-invoice) for granular experiment tracking
-- Catches per-invoice exceptions and returns partial successes — a single bad invoice does not fail the batch
+| File | Responsibility |
+|---|---|
+| `app.py` | Entry point — MLflow bootstrap via `lifespan`, router registration, no business logic |
+| `models.py` | Pydantic models — `InvoiceInput`, `DraftRequest`, `DraftResult`, `DraftError`, `DraftResponse` |
+| `routes/system.py` | `GET /health`, `GET /docs` (Scalar dark-mode UI), `GET /.well-known/agent.json` |
+| `routes/a2a.py` | `POST /a2a` — Google A2A JSON-RPC 2.0 endpoint |
+| `routes/draft.py` | `POST /draft` — batch invoice processing, MLflow flat run, scorer logging |
 
 **Endpoint summary:**
 
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/health` | Liveness probe |
+| GET | `/docs` | Scalar API Reference (dark-mode, interactive) |
 | GET | `/.well-known/agent.json` | A2A Agent Card (discovery) |
 | POST | `/a2a` | A2A JSON-RPC 2.0 (agent interop) |
 | POST | `/draft` | Batch invoice → email drafting |
+
+**API Documentation — Scalar**
+
+The default Swagger and ReDoc UIs are disabled. Instead, `routes/system.py` serves a custom **Scalar** API reference page at `/docs`:
+- Theme: `saturn` with GitHub-dark CSS palette
+- Layout: `modern` with dark mode enabled
+- Default HTTP client: Python `requests`
+- Pre-filtered to show only relevant language clients
 
 ---
 
@@ -256,28 +268,30 @@ sequenceDiagram
     participant Eval as Scorers
 
     Caller->>API: POST /draft with invoice list
-    API->>MLf: start_run("draft-batch")
-    API->>MLf: start_run("draft-INV-001", nested)
+    API->>MLf: start_run("batch-YYYYMMDD-HHMMSS")
+    Note over API,MLf: One flat run for the whole batch
 
-    API->>A1: invoice_number, company, amount, due_date
-    A1->>MCP: fetch_client_by_invoice("INV-001")
-    MCP->>CRM: fetch_client("INV-001")
-    CRM-->>MCP: ClientRecord dict
-    MCP-->>A1: JSON string
+    loop for each invoice
+        API->>A1: invoice_number, company, amount, due_date
+        A1->>MCP: fetch_client_by_invoice("INV-001")
+        MCP->>CRM: fetch_client("INV-001")
+        CRM-->>MCP: ClientRecord dict
+        MCP-->>A1: JSON string
 
-    A1-->>A2: client record (context)
-    Note over A2: Applies TONE_RUBRIC<br/>against relationship_info
-    A2-->>A3: tone_score + reasoning (context)
+        A1-->>A2: client record (context)
+        Note over A2: Applies TONE_RUBRIC<br/>against relationship_info
+        A2-->>A3: tone_score + reasoning (context)
 
-    Note over A3: Drafts email body<br/>calibrated to tone_score
-    A3-->>API: subject + description
+        Note over A3: Drafts email body<br/>calibrated to tone_score
+        A3-->>API: subject + description
 
-    API->>Eval: run_scorers(result)
-    Eval-->>API: name, value, rationale per scorer
-    API->>MLf: log_metric — tone_consistency, completeness, guardrail
-    API->>MLf: end nested run
-    API->>MLf: end parent run
+        API->>Eval: run_scorers(result)
+        Eval-->>API: name, value, rationale per scorer
+        API->>MLf: MlflowClient.log_metric(run_id, "INV-001/tone_consistency", ...)
+        Note over API,MLf: Explicit run_id — bypasses<br/>autolog context interference
+    end
 
+    API->>MLf: end batch run
     API-->>Caller: DraftResponse — results + errors
 ```
 
@@ -400,21 +414,31 @@ flowchart TD
     style comp_detail fill:#f0fdf4,stroke:#bbf7d0
 ```
 
-### MLflow Metric Schema
+### MLflow Run Structure — Flat Batch Run
 
-Each nested run logs:
+Each call to `POST /draft` produces a **single flat MLflow run** named `batch-{YYYYMMDD-HHMMSS}`. All per-invoice metrics are namespaced within that run using the invoice number as a prefix:
 
 ```
-tone_consistency                  1.0 / 0.0
-completeness_greeting             1.0 / 0.0
-completeness_invoice_reference    1.0 / 0.0
-completeness_amount               1.0 / 0.0
-completeness_call_to_action       1.0 / 0.0
-completeness_sign_off             1.0 / 0.0
-completeness_overall              1.0 / 0.0
-guardrail_pass                    1.0 / 0.0
-llm_judge_professional_tone       0.0–1.0  (optional)
+INV-001/tone_consistency                  1.0 / 0.0
+INV-001/completeness_greeting             1.0 / 0.0
+INV-001/completeness_invoice_reference    1.0 / 0.0
+INV-001/completeness_amount               1.0 / 0.0
+INV-001/completeness_call_to_action       1.0 / 0.0
+INV-001/completeness_sign_off             1.0 / 0.0
+INV-001/completeness_overall              1.0 / 0.0
+INV-001/guardrail_pass                    1.0 / 0.0
+INV-001/llm_judge_professional_tone       0.0–1.0  (optional)
+
+INV-006/tone_consistency                  ...
 ```
+
+**Why flat over nested?**
+
+The previous design used a parent run with nested child runs (one child per invoice). MLflow's `mlflow.crewai.autolog()` — enabled for tracing — interferes with the active run context during `crew.kickoff()`, causing nested metrics to land on the wrong run or fail silently. The flat design solves this by:
+
+1. Opening a single run before the loop begins
+2. Using `MlflowClient.log_metric(run_id, ...)` to target the run explicitly by ID, bypassing the active-run context stack entirely
+3. Namespacing metrics per invoice so all data is visible in one Databricks UI row
 
 ---
 
@@ -432,10 +456,9 @@ flowchart TD
     REQ(["POST /draft\ninvoice_number, company_name, amount, due_date"]):::entry
 
     REQ --> VAL["Pydantic Validation"]:::api
-    VAL --> PR["MLflow parent run\ndraft-batch"]:::mlflow
-    PR --> NR["MLflow nested run\ndraft-invoice_number"]:::mlflow
+    VAL --> PR["MLflow flat batch run\nbatch-YYYYMMDD-HHMMSS"]:::mlflow
 
-    NR --> INV["run_for_invoice"]:::api
+    PR --> INV["run_for_invoice (per invoice)"]:::api
 
     subgraph pipeline ["  CrewAI Pipeline  "]
         INV --> F["Agent 1 — CRM Fetcher\nfetch_client_by_invoice via FastMCP"]:::agent
@@ -445,8 +468,8 @@ flowchart TD
 
     D --> PARSE["Parse output JSON\nfallback: regex"]:::parse
     PARSE --> SCORE["run_scorers\ntone + completeness + guardrail"]:::eval
-    SCORE --> LOG["log_scores_to_mlflow"]:::mlflow
-    LOG --> CLOSE["Close nested run\nClose parent run"]:::mlflow
+    SCORE --> LOG["MlflowClient.log_metric(run_id,\n'INV-001/tone_consistency', ...)"]:::mlflow
+    LOG --> CLOSE["Close batch run"]:::mlflow
     CLOSE --> RESP(["DraftResponse\nresults + errors"]):::entry
 
     style pipeline fill:#f5f3ff,stroke:#ddd6fe
@@ -455,6 +478,22 @@ flowchart TD
 ---
 
 ## 9. Key Design Decisions
+
+### Modular Route Structure
+
+The original `app.py` held all endpoints, models, and MLflow logic in a single file (~370 lines). This was split into:
+
+- `models.py` — all Pydantic schemas in one place, importable by any module
+- `routes/system.py` — infrastructure endpoints (health, docs, agent card) kept separate from business logic
+- `routes/draft.py` — the core `/draft` handler with all MLflow instrumentation
+- `routes/a2a.py` — A2A protocol handler isolated from REST concerns
+- `app.py` — thin entry point: `_setup_mlflow()`, `lifespan`, and three `include_router()` calls
+
+Each route file is independently testable and navigable. Patch paths in tests reflect the actual module (`routes.draft.run_for_invoice`) rather than the app namespace.
+
+### Flat MLflow Run vs. Nested Runs
+
+Nested parent/child runs were the initial design. `mlflow.crewai.autolog()` enables tracing during `crew.kickoff()`, which interferes with the MLflow active run context in some versions — causing `mlflow.log_metric()` inside `log_scores_to_mlflow()` to target the autolog trace run rather than the intended child run. The fix: replace context-dependent `mlflow.log_metric()` calls with `MlflowClient.log_metric(run_id, ...)`, which targets a specific run by ID regardless of what the active context is. This also simplifies the run structure from two levels to one.
 
 ### Sequential vs. Parallel Agents
 CrewAI's sequential process was chosen deliberately. Each agent's output is the next agent's input — tone analysis requires the CRM record, email drafting requires the tone score. True parallelism isn't applicable within a single invoice. For batches, the natural parallelisation point is at the `/draft` endpoint level (future: `asyncio.gather` over invoices).

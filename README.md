@@ -110,10 +110,16 @@ cp .env.example .env
 ### 2. Start with Docker
 
 ```bash
-docker compose up --build
+make up
 ```
 
-The service starts on `http://localhost:8000`. The first build takes a few minutes to install all dependencies.
+This builds the image, starts the container, waits for the health check, then **automatically opens the docs in your browser**. The first build takes a few minutes to install all dependencies.
+
+Alternatively, without `make`:
+
+```bash
+docker compose up --build
+```
 
 ### 3. Verify it's running
 
@@ -126,14 +132,13 @@ curl http://localhost:8000/health
 
 ## Interactive API Docs
 
-Once the service is running, open **[http://localhost:8000/docs](http://localhost:8000/docs)** in your browser.
+Once the service is running, open **[http://localhost:8000/docs](http://localhost:8000/docs)** in your browser (`make up` does this automatically).
 
-You get a full Swagger UI with **pre-filled examples** — hit **Try it out** on any endpoint and click **Execute**. No Postman or curl setup needed.
+The docs are served via **[Scalar](https://scalar.com/)** — a minimalistic, modern dark-mode API reference. It comes with **pre-filled request examples**, a built-in HTTP client, and a clean layout. No Postman or curl setup needed.
 
 | Interface | URL |
 |---|---|
-| Swagger UI (interactive) | `http://localhost:8000/docs` |
-| ReDoc (reference) | `http://localhost:8000/redoc` |
+| Scalar (interactive, dark mode) | `http://localhost:8000/docs` |
 
 ---
 
@@ -298,6 +303,18 @@ Create a `.env` file in the project root (copy from `.env.example`):
 
 ---
 
+## Makefile Commands
+
+| Command | What it does |
+|---|---|
+| `make up` | Build + start Docker (detached), poll `/health`, open browser, follow logs |
+| `make down` | Stop and remove containers |
+| `make logs` | Tail Docker logs |
+| `make dev` | Run locally with `uvicorn --reload`, poll health, open browser |
+| `make test` | Run the full pytest suite |
+
+---
+
 ## Local Development (without Docker)
 
 **Prerequisites:** Python 3.11+
@@ -318,7 +335,10 @@ pip install -e .
 cp .env.example .env
 # Edit .env with your keys
 
-# 5. Run
+# 5. Run (with auto-open browser)
+make dev
+
+# Or manually:
 uvicorn app:app --reload --port 8000
 ```
 
@@ -382,9 +402,15 @@ The mock CRM covers all tone tiers out of the box:
 ```
 cashCollection-A2A/
 │
-├── app.py                  # FastAPI application — endpoints & MLflow setup
+├── app.py                  # FastAPI entry point — app setup, lifespan, router registration
+├── models.py               # Pydantic models — InvoiceInput, DraftRequest, DraftResponse
 ├── crm.py                  # Mock CRM data store (8 client records)
 ├── mcp_server.py           # FastMCP server — exposes fetch_client_by_invoice tool
+│
+├── routes/
+│   ├── system.py           # GET /health, GET /docs (Scalar UI), GET /.well-known/agent.json
+│   ├── a2a.py              # POST /a2a — Google A2A JSON-RPC 2.0 endpoint
+│   └── draft.py            # POST /draft — batch invoice processing + MLflow logging
 │
 ├── crew/
 │   ├── email_crew.py       # Three-agent CrewAI pipeline
@@ -397,6 +423,7 @@ cashCollection-A2A/
 ├── evaluation/
 │   └── scorers.py          # tone_consistency, completeness, guardrail, llm_judge
 │
+├── Makefile                # make up / down / dev / logs / test
 ├── Dockerfile
 ├── docker-compose.yml
 ├── pyproject.toml

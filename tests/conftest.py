@@ -37,5 +37,6 @@ def mock_mlflow():
         patch("mlflow.log_metric"),
         patch("mlflow.start_run"),
         patch("mlflow.crewai.autolog"),
+        patch("mlflow.tracking.MlflowClient"),
     ):
         yield

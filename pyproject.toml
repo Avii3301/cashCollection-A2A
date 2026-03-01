@@ -38,7 +38,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["crew*", "a2a*", "evaluation*"]
+include = ["crew*", "a2a*", "evaluation*", "routes*"]
 
 [tool.pytest.ini_options]
 # Add project root to sys.path so tests can import top-level modules
