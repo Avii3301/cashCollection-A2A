@@ -30,73 +30,58 @@ The system is a **FastAPI microservice** that exposes two interfaces:
 - **REST (`POST /draft`)** — direct batch processing, synchronous response
 - **A2A (`POST /a2a`)** — Google Agent-to-Agent JSON-RPC 2.0 protocol, making this service consumable by any A2A-compatible orchestrator
 
-Each invoice flows through a **three-agent CrewAI pipeline**. The agents communicate via tool calls over the **Model Context Protocol (MCP)** for CRM data retrieval. Every output is evaluated by a **quality scorer pipeline** before results are returned and metrics are persisted to **MLflow / Databricks**.
+Each invoice flows through a **three-agent CrewAI pipeline**. Agent 1 retrieves CRM data via an in-process **FastMCP** tool call. Agent 2 applies a tone rubric to decide the appropriate tone score. Agent 3 drafts the email. Every output is evaluated by a **quality scorer pipeline** and all metrics are persisted to **MLflow / Databricks**.
 
 ---
 
 ## 3. Architecture Diagram
 
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                         Caller Layer                                     │
-│                                                                          │
-│   curl / HTTP client          A2A-compatible Agent / Orchestrator        │
-│         │                                │                               │
-│         │  POST /draft                   │  POST /a2a (JSON-RPC 2.0)     │
-└─────────┼───────────────────────────────┼───────────────────────────────┘
-          │                               │
-          ▼                               ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        FastAPI Service  (:8000)                         │
-│                                                                         │
-│  ┌─────────────┐  ┌──────────────────────────┐  ┌──────────────────┐   │
-│  │ GET /health │  │ GET /.well-known/         │  │  POST /a2a       │   │
-│  └─────────────┘  │       agent.json         │  │  (task_handler)  │   │
-│                   │  (A2A Agent Card)         │  └────────┬─────────┘   │
-│                   └──────────────────────────┘           │             │
-│                                                           │             │
-│  ┌────────────────────────────────────────────────────────▼──────────┐  │
-│  │                    POST /draft  (DraftRequest)                    │  │
-│  │                  MLflow run context wraps each invoice            │  │
-│  └─────────────────────────────────┬──────────────────────────────── ┘  │
-└────────────────────────────────────┼────────────────────────────────────┘
-                                     │  one run_for_invoice() call per invoice
-                                     ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│                       CrewAI  Pipeline                                 │
-│                                                                        │
-│  ┌──────────────────┐     ┌──────────────────┐     ┌────────────────┐ │
-│  │    Agent 1       │     │    Agent 2       │     │   Agent 3      │ │
-│  │  CRM Fetcher     │────►│  Tone Analyzer   │────►│ Email Drafter  │ │
-│  │                  │     │                  │     │                │ │
-│  │ tool: MCP call   │     │ input: tone      │     │ input: CRM +   │ │
-│  │   ▼              │     │ rubric (0-5)     │     │ tone_score     │ │
-│  │ MCP STDIO        │     │ output: JSON     │     │ output: JSON   │ │
-│  │ subprocess       │     │ {tone_score,     │     │ {subject,      │ │
-│  │   ▼              │     │  reasoning}      │     │  description}  │ │
-│  │ mcp_server.py    │     └──────────────────┘     └────────────────┘ │
-│  │   ▼              │                                                  │
-│  │  crm.py lookup   │                                                  │
-│  └──────────────────┘                                                  │
-└──────────────────────────────┬─────────────────────────────────────────┘
-                               │
-                               ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│                     Evaluation Pipeline                              │
-│                                                                      │
-│   tone_consistency   completeness_*   guardrail_pass   llm_judge     │
-│         │                 │                │               │         │
-│         └─────────────────┴────────────────┴───────────────┘         │
-│                                   │                                  │
-│                          log_scores_to_mlflow()                      │
-└──────────────────────────────────┬───────────────────────────────────┘
-                                   │
-                                   ▼
-                    ┌──────────────────────────┐
-                    │   MLflow / Databricks    │
-                    │  experiment tracking +   │
-                    │  metric history          │
-                    └──────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph callers [Caller Layer]
+        H([HTTP Client\ncurl / Postman])
+        A([A2A Agent\nOrchestrator])
+    end
+
+    subgraph api [FastAPI Service :8000]
+        EP1[GET /health]
+        EP2[GET /.well-known/agent.json\nA2A Agent Card]
+        EP3[POST /a2a\nJSON-RPC 2.0]
+        EP4[POST /draft\nBatch Processing]
+    end
+
+    subgraph crew [CrewAI Pipeline]
+        AG1[Agent 1\nCRM Fetcher]
+        AG2[Agent 2\nTone Analyzer]
+        AG3[Agent 3\nEmail Drafter]
+        AG1 -->|client record| AG2
+        AG2 -->|tone_score| AG3
+    end
+
+    subgraph mcp [FastMCP Server — in-process]
+        TOOL[fetch_client_by_invoice]
+        CRM[(CRM Data\ncrm.py)]
+        TOOL --> CRM
+    end
+
+    subgraph eval [Evaluation Pipeline]
+        S1[tone_consistency]
+        S2[completeness_*]
+        S3[guardrail_pass]
+        S4[llm_judge\noptional]
+    end
+
+    MLf[(MLflow\nDatabricks)]
+
+    H -->|POST /draft| EP4
+    A -->|POST /a2a| EP3
+    EP3 --> EP4
+    EP4 --> AG1
+    AG1 <-->|FetchClientTool| TOOL
+    AG3 -->|subject + description| EP4
+    EP4 --> S1 & S2 & S3 & S4
+    S1 & S2 & S3 & S4 --> MLf
+    EP4 -->|DraftResponse| H
 ```
 
 ---
@@ -107,19 +92,19 @@ Each invoice flows through a **three-agent CrewAI pipeline**. The agents communi
 
 The entry point. Responsibilities:
 
-- Bootstraps MLflow tracking at startup via `lifespan` context
+- Bootstraps MLflow tracking at startup via `lifespan` context manager
 - Validates all incoming requests with Pydantic models
 - Wraps each invoice in a **nested MLflow run** (parent = batch, child = per-invoice) for granular experiment tracking
 - Catches per-invoice exceptions and returns partial successes — a single bad invoice does not fail the batch
 
 **Endpoint summary:**
 
-```
-GET  /health                  — liveness probe
-GET  /.well-known/agent.json  — A2A Agent Card (discovery)
-POST /a2a                     — A2A JSON-RPC 2.0 (agent interop)
-POST /draft                   — batch invoice processing (direct API)
-```
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/health` | Liveness probe |
+| GET | `/.well-known/agent.json` | A2A Agent Card (discovery) |
+| POST | `/a2a` | A2A JSON-RPC 2.0 (agent interop) |
+| POST | `/draft` | Batch invoice → email drafting |
 
 ---
 
@@ -127,10 +112,24 @@ POST /draft                   — batch invoice processing (direct API)
 
 A sequential CrewAI crew. Each agent uses `gpt-4o-mini` with `temperature=0.3` for low-variance, consistent outputs.
 
+```mermaid
+flowchart LR
+    IN([invoice_number\ncompany_name\namount\ndue_date])
+
+    subgraph crew [CrewAI Sequential Crew]
+        A1["Agent 1\nCRM Fetcher\n─────────────\ntool: FetchClientTool\noutput: client record JSON"]
+        A2["Agent 2\nTone Analyzer\n─────────────\ninput: client record + rubric\noutput: {tone_score, reasoning}"]
+        A3["Agent 3\nEmail Drafter\n─────────────\ninput: client record + tone_score\noutput: {subject, description}"]
+    end
+
+    OUT([subject\ndescription\ntone_score])
+
+    IN --> A1 --> A2 --> A3 --> OUT
+```
+
 **Agent 1 — CRM Fetcher**
-- Uses the MCP tool `fetch_client_by_invoice` to retrieve the full client record
-- Passes the raw record to Agent 2 unchanged — no interpretation at this stage
-- `allow_delegation=False` ensures it stays focused on the single retrieval task
+- Uses `FetchClientTool` (a custom CrewAI `BaseTool`) to call the FastMCP server in-process
+- Passes the raw client record to Agent 2 unchanged — no interpretation at this stage
 
 **Agent 2 — Tone Analyzer**
 - Receives the client record and the full tone rubric text
@@ -141,56 +140,69 @@ A sequential CrewAI crew. Each agent uses `gpt-4o-mini` with `temperature=0.3` f
 - Receives both the CRM record and the decided tone score
 - Must produce all four structural elements: greeting, body (invoice + amount + date), call-to-action, sign-off
 - Outputs strict JSON: `{"subject": str, "description": str}`
-- Same dual-parser fallback as Agent 2
 
 ---
 
-### 4.3 `mcp_server.py` — MCP Tool Server
+### 4.3 `mcp_server.py` — FastMCP Tool Server
 
-A **FastMCP STDIO server** exposing the `fetch_client_by_invoice` tool.
+A **FastMCP** server object that exposes the `fetch_client_by_invoice` tool.
 
-- Launched as a **subprocess** by CrewAI's `MCPServerAdapter` for each crew run
-- Communication is over `stdin/stdout` using the MCP STDIO transport — no network port required
-- `PYTHONPATH` is explicitly set to the project root before spawn so `crm.py` (a top-level module) is importable in the subprocess environment
-- In production, replace `crm.py` with a real CRM API call inside this server — the CrewAI side requires no changes
+```mermaid
+flowchart LR
+    TOOL["FetchClientTool._run()\nin crew/email_crew.py"]
+    CLIENT["fastmcp.Client\nasync context manager"]
+    SERVER["FastMCP server object\nmcp_server.py"]
+    CRM["crm.fetch_client()\ncrm.py"]
+
+    TOOL -->|asyncio.run| CLIENT
+    CLIENT <-->|in-process\nno subprocess| SERVER
+    SERVER --> CRM
+    CRM -->|ClientRecord dict| SERVER
+    SERVER -->|JSON string| CLIENT
+    CLIENT -->|text| TOOL
+```
+
+- Imported directly into the agent crew — no subprocess, no network port
+- Can also run standalone via `python mcp_server.py` (STDIO transport) for external A2A use
+- In production, replace `crm.fetch_client()` with a real CRM API call — the crew requires no changes
 
 ---
 
 ### 4.4 `crm.py` — Mock CRM
 
-A typed dictionary store (`TypedDict`) with 8 records covering every tone tier from 0 to 5. Designed to be a drop-in replacement target — swap `fetch_client()` with a real HTTP call to Salesforce, HubSpot, or any CRM API.
+A typed dictionary store (`TypedDict`) with 8 records covering every tone tier from 0 to 5. Drop-in replacement target — swap `fetch_client()` with a real HTTP call to Salesforce, HubSpot, or any CRM API.
 
 ---
 
 ### 4.5 `a2a/` — Agent-to-Agent Protocol
 
-Implements the [Google A2A specification](https://github.com/google-a2a/A2A):
+Implements the [Google A2A specification](https://github.com/google-a2a/A2A).
 
-**`agent_card.py`** — builds the Agent Card JSON served at `/.well-known/agent.json`. Contains:
-- Agent name, description, version
-- Skill definitions with input/output JSON schemas
-- Supported transport modes
+**Task state machine:**
 
-**`task_handler.py`** — JSON-RPC 2.0 dispatcher with an in-memory task store:
-
-```
-Task state machine:
-
-  submitted ──► working ──► completed
-                       └──► failed  (only if ALL invoices errored)
+```mermaid
+stateDiagram-v2
+    [*] --> submitted : tasks/send received
+    submitted --> working : processing starts
+    working --> completed : ≥1 invoice succeeded
+    working --> failed : all invoices errored
+    completed --> [*]
+    failed --> [*]
 ```
 
-The A2A endpoint returns the full task object including artifacts, allowing callers to poll via `tasks/get`.
+**`agent_card.py`** — builds the Agent Card JSON served at `/.well-known/agent.json`. Contains agent name, description, skill definitions, input/output schemas, and supported transport modes.
+
+**`task_handler.py`** — JSON-RPC 2.0 dispatcher with an in-memory task store supporting `tasks/send` and `tasks/get`.
 
 ---
 
 ### 4.6 `evaluation/scorers.py` — Quality Pipeline
 
-Four scorers, all operating on the final `{invoice_number, tone_score, subject, description}` dict:
+Four scorers operating on the final `{invoice_number, tone_score, subject, description}` dict:
 
 | Scorer | Method | Pass condition |
 |---|---|---|
-| `tone_consistency` | Regex keyword match | Firm markers present for score ≤1; polite markers for score ≥4 |
+| `tone_consistency` | Regex keyword match | Firm markers for score ≤1; polite markers for score ≥4 |
 | `completeness_greeting` | Regex | `dear`, `hello`, or `hi` detected |
 | `completeness_invoice_reference` | Regex | Invoice number pattern detected |
 | `completeness_amount` | Regex | Dollar amount or "outstanding balance" detected |
@@ -205,63 +217,70 @@ Four scorers, all operating on the final `{invoice_number, tone_score, subject, 
 
 ### Sequence Diagram
 
-```
-  Caller          FastAPI         CrewAI          MCP Server         CRM
-    │                │               │                 │               │
-    │─── POST /draft ►│               │                 │               │
-    │                │──run_for_inv──►│                 │               │
-    │                │               │                 │               │
-    │                │               │── spawn subprocess ──────────── │
-    │                │               │                 │               │
-    │                │   [Agent 1]   │                 │               │
-    │                │               │──fetch_client──►│               │
-    │                │               │                 │──lookup──────►│
-    │                │               │                 │◄── record ────│
-    │                │               │◄── client record│               │
-    │                │               │                 │               │
-    │                │   [Agent 2]   │                 │               │
-    │                │               │── analyze tone ─┤ (LLM call)   │
-    │                │               │◄─ {tone_score}  │               │
-    │                │               │                 │               │
-    │                │   [Agent 3]   │                 │               │
-    │                │               │── draft email ──┤ (LLM call)   │
-    │                │               │◄─ {subject,     │               │
-    │                │               │   description}  │               │
-    │                │               │                 │               │
-    │                │               │── terminate subprocess ──────── │
-    │                │◄── result ────│                 │               │
-    │                │               │                 │               │
-    │                │   [Scorers]   │                 │               │
-    │                │── evaluate ───┤                 │               │
-    │                │── log MLflow ─┤                 │               │
-    │                │               │                 │               │
-    │◄── DraftResponse│               │                 │               │
-    │                │               │                 │               │
+```mermaid
+sequenceDiagram
+    actor Caller
+    participant API as FastAPI /draft
+    participant MLf as MLflow
+    participant A1 as Agent 1<br/>CRM Fetcher
+    participant MCP as FastMCP Server
+    participant CRM as crm.py
+    participant A2 as Agent 2<br/>Tone Analyzer
+    participant A3 as Agent 3<br/>Email Drafter
+    participant Eval as Scorers
+
+    Caller->>API: POST /draft {invoices: [...]}
+    API->>MLf: start_run("draft-batch")
+    API->>MLf: start_run("draft-INV-001", nested)
+
+    API->>A1: invoice_number, company, amount, due_date
+    A1->>MCP: fetch_client_by_invoice("INV-001")
+    MCP->>CRM: fetch_client("INV-001")
+    CRM-->>MCP: ClientRecord dict
+    MCP-->>A1: JSON string
+
+    A1-->>A2: client record (context)
+    Note over A2: Applies TONE_RUBRIC<br/>against relationship_info
+    A2-->>A3: {tone_score, reasoning} (context)
+
+    Note over A3: Drafts email body<br/>calibrated to tone_score
+    A3-->>API: {subject, description}
+
+    API->>Eval: run_scorers(result)
+    Eval-->>API: [{name, value, rationale}, ...]
+    API->>MLf: log_metric(tone_consistency, completeness_*, guardrail_pass)
+    API->>MLf: end nested run
+    API->>MLf: end parent run
+
+    API-->>Caller: DraftResponse {results, errors}
 ```
 
 ---
 
 ## 6. Protocol Implementations
 
-### 6.1 Model Context Protocol (MCP)
+### 6.1 Model Context Protocol (MCP) — In-Process
 
-MCP provides a standardised way for LLM agents to call tools hosted in external processes. This project uses the **STDIO transport**:
+MCP provides a standardised way for LLM agents to call tools. This project uses **FastMCP with in-process transport** — the server object is imported directly, no subprocess or network port needed.
 
+```mermaid
+flowchart LR
+    subgraph crew_process [Same Python Process]
+        AGENT["CrewAI Agent\nFetchClientTool._run()"]
+        CLIENT["fastmcp.Client\n(async context manager)"]
+        SERVER["FastMCP mcp object\nmcp_server.py"]
+        CRM["crm.fetch_client()"]
+
+        AGENT -->|asyncio.run| CLIENT
+        CLIENT <-->|in-process call| SERVER
+        SERVER --> CRM
+    end
 ```
-  CrewAI Agent (MCPServerAdapter)
-         │
-         │  spawn:  python mcp_server.py
-         │          env: PYTHONPATH=/app
-         │
-         ├──► stdin  ──► FastMCP server reads JSON-RPC tool calls
-         └──► stdout ◄── FastMCP server writes JSON-RPC results
-```
 
-**Why STDIO over HTTP?**
-- Zero network configuration — no port allocation required
-- Subprocess lifecycle is tied to the crew run — automatic cleanup
-- Eliminates authentication concerns for an internal tool
-- Suitable for single-node deployments; upgrade path is MCP over SSE/HTTP for distributed setups
+**Why in-process over subprocess?**
+- `crewai_tools.MCPServerAdapter` uses an interactive `click.confirm()` check for the `mcp` package — in a non-TTY Docker container this raises `click.exceptions.Abort`, crashing the server silently
+- In-process removes the subprocess entirely: no spawn latency, no PYTHONPATH wiring, no TTY issues
+- The `mcp_server.py` object can still run standalone via STDIO for external use
 
 **Tool exposed:**
 
@@ -276,44 +295,24 @@ fetch_client_by_invoice(invoice_number: str) -> dict
 
 ### 6.2 Google A2A Protocol (Agent-to-Agent)
 
-A2A defines how autonomous agents discover and interact with each other. This service implements two sides of the spec:
+A2A defines how autonomous agents discover and interact with each other.
 
-**Discovery** — `GET /.well-known/agent.json`
+```mermaid
+sequenceDiagram
+    participant Orch as A2A Orchestrator
+    participant Agent as This Service
 
-Any A2A-compatible orchestrator can call this endpoint to learn:
-- What this agent does
-- What input schemas it accepts
-- What output schemas it produces
-- What authentication it requires (none in this implementation)
+    Note over Orch,Agent: 1. Discovery
+    Orch->>Agent: GET /.well-known/agent.json
+    Agent-->>Orch: {name, description, skills, inputModes}
 
-**Task Execution** — `POST /a2a`
+    Note over Orch,Agent: 2. Task Execution
+    Orch->>Agent: POST /a2a {jsonrpc:"2.0", method:"tasks/send", params:{...}}
+    Agent-->>Orch: {jsonrpc:"2.0", result:{id, status:{state:"completed"}, artifacts:[...]}}
 
-```
-JSON-RPC 2.0 request:
-{
-  "jsonrpc": "2.0",
-  "id": "req-1",
-  "method": "tasks/send",    ← or "tasks/get"
-  "params": { "message": { "parts": [{ "type": "data", "data": {...} }] } }
-}
-
-JSON-RPC 2.0 response:
-{
-  "jsonrpc": "2.0",
-  "id": "req-1",
-  "result": {
-    "id": "<uuid>",
-    "status": { "state": "completed" },
-    "artifacts": [{ "name": "drafted_emails", "parts": [...] }]
-  }
-}
-```
-
-**Task states:**
-
-```
-submitted ──► working ──► completed   (≥1 invoice succeeded)
-                     └──► failed      (all invoices errored)
+    Note over Orch,Agent: 3. Optional Polling
+    Orch->>Agent: POST /a2a {method:"tasks/get", params:{id:"..."}}
+    Agent-->>Orch: {result:{status, artifacts}}
 ```
 
 ---
@@ -322,127 +321,109 @@ submitted ──► working ──► completed   (≥1 invoice succeeded)
 
 ### Why Evaluate at Inference Time?
 
-LLMs are non-deterministic. Even with `temperature=0.3`, occasional outputs miss structural elements, slip in the wrong tone markers, or (rarely) produce content that passes the prompt but fails a content policy. By running scorers synchronously on every output:
+LLMs are non-deterministic. Even with `temperature=0.3`, occasional outputs miss structural elements, use the wrong tone markers, or produce borderline content. By running scorers synchronously on every output:
 
-- Failures are surfaced immediately in the API response (via logs and MLflow metrics)
-- Metric trends in MLflow reveal prompt regressions over time
+- Failures are surfaced immediately in logs and MLflow metrics
+- Metric trends reveal prompt regressions over time without manual inspection
 - The guardrail scorer acts as a hard content safety layer
 
-### Scorer Architecture
+### Scorer Flow
 
-```
-draft output dict
-       │
-       ├──► tone_consistency_scorer()     ──► {name, value: bool, rationale}
-       │
-       ├──► completeness_scorer()         ──► [{name, value: bool, rationale}  × 6]
-       │       ├── completeness_greeting
-       │       ├── completeness_invoice_reference
-       │       ├── completeness_amount
-       │       ├── completeness_call_to_action
-       │       ├── completeness_sign_off
-       │       └── completeness_overall
-       │
-       ├──► guardrail_scorer()            ──► {name, value: bool, rationale}
-       │
-       └──► _llm_judge_scorer()           ──► {name, value: float|None, rationale}
-                (only if LLM_JUDGE_ENABLED=true)
-                        │
-                        └── MLflow Guidelines scorer
-                            (gpt-4o evaluates holistic appropriateness)
+```mermaid
+flowchart TD
+    OUT([Draft Output\ntone_score + subject + description])
+
+    OUT --> T[tone_consistency_scorer]
+    OUT --> C[completeness_scorer]
+    OUT --> G[guardrail_scorer]
+    OUT --> L[_llm_judge_scorer\nonly if LLM_JUDGE_ENABLED=true]
+
+    subgraph tone_detail [Tone Consistency Logic]
+        T --> T0{score ≤ 1?}
+        T0 -->|yes| T1[Check: final notice,\n48 hours, legal action...]
+        T0 -->|no| T2{score ≥ 4?}
+        T2 -->|yes| T3[Check: appreciate,\nvalued partner, grateful...]
+        T2 -->|no| T4[Neutral 2–3\nauto-pass]
+    end
+
+    subgraph comp_detail [Completeness — 5 Checks]
+        C --> C1[greeting]
+        C --> C2[invoice_reference]
+        C --> C3[amount]
+        C --> C4[call_to_action]
+        C --> C5[sign_off]
+        C1 & C2 & C3 & C4 & C5 --> C6[completeness_overall]
+    end
+
+    T & C6 & G & L --> MLf[(MLflow Metrics\n1.0 = pass / 0.0 = fail)]
 ```
 
 ### MLflow Metric Schema
 
-Each nested run logs these metrics:
+Each nested run logs:
 
 ```
-tone_consistency          1.0 / 0.0
-completeness_greeting     1.0 / 0.0
-completeness_invoice_reference  1.0 / 0.0
-completeness_amount       1.0 / 0.0
-completeness_call_to_action     1.0 / 0.0
-completeness_sign_off     1.0 / 0.0
-completeness_overall      1.0 / 0.0
-guardrail_pass            1.0 / 0.0
-llm_judge_professional_tone     0.0–1.0  (optional)
+tone_consistency                  1.0 / 0.0
+completeness_greeting             1.0 / 0.0
+completeness_invoice_reference    1.0 / 0.0
+completeness_amount               1.0 / 0.0
+completeness_call_to_action       1.0 / 0.0
+completeness_sign_off             1.0 / 0.0
+completeness_overall              1.0 / 0.0
+guardrail_pass                    1.0 / 0.0
+llm_judge_professional_tone       0.0–1.0  (optional)
 ```
 
 ---
 
 ## 8. Data Flow — End to End
 
-### Single invoice through `POST /draft`
+```mermaid
+flowchart TD
+    REQ([POST /draft\n{invoice_number, company_name, amount, due_date}])
 
-```
-1.  Request arrives at POST /draft
-       └── Pydantic validates: {invoice_number, company_name, amount, due_date}
+    REQ --> VAL[Pydantic Validation]
+    VAL --> PR[MLflow parent run\ndraft-batch]
+    PR --> NR[MLflow nested run\ndraft-invoice_number]
 
-2.  MLflow parent run starts: "draft-batch"
-       └── logs batch_size param
+    NR --> INV[run_for_invoice]
 
-3.  For each invoice, MLflow nested run starts: "draft-{invoice_number}"
-       └── logs: invoice_number, company_name, amount, due_date
+    subgraph pipeline [CrewAI Pipeline]
+        INV --> F[Agent 1: fetch_client_by_invoice\nvia FastMCP in-process]
+        F --> T[Agent 2: apply TONE_RUBRIC\nLLM → tone_score 0-5]
+        T --> D[Agent 3: draft email\nLLM → subject + description]
+    end
 
-4.  run_for_invoice(invoice) called:
-
-    a.  CrewAI builds StdioServerParameters
-           └── command = sys.executable
-               args    = [/app/mcp_server.py]
-               env     = {**os.environ, PYTHONPATH: /app}
-
-    b.  MCPServerAdapter spawns mcp_server.py subprocess
-
-    c.  Agent 1 sends MCP tool call: fetch_client_by_invoice(invoice_number)
-           └── subprocess looks up crm.py → returns ClientRecord dict
-
-    d.  Agent 2 receives ClientRecord + TONE_RUBRIC text
-           └── LLM call → {"tone_score": 0-5, "reasoning": "..."}
-           └── Parsed with JSON → regex fallback
-
-    e.  Agent 3 receives ClientRecord + tone_score
-           └── LLM call → {"subject": "...", "description": "..."}
-           └── Parsed with JSON → regex fallback
-
-    f.  MCP subprocess terminated
-
-5.  run_scorers(result) evaluates the output:
-       └── tone_consistency, completeness_*, guardrail_pass
-
-6.  log_scores_to_mlflow(scores) writes metrics to the nested run
-
-7.  mlflow.log_param("tone_score", result["tone_score"])
-
-8.  Nested MLflow run closes
-
-9.  Parent MLflow run closes, logs invoices_processed, invoices_errored
-
-10. DraftResponse returned: {results: [...], errors: [...]}
+    D --> PARSE[Parse output JSON\nfallback: regex]
+    PARSE --> SCORE[run_scorers\ntone + completeness + guardrail]
+    SCORE --> LOG[log_scores_to_mlflow]
+    LOG --> CLOSE[Close nested run\nClose parent run]
+    CLOSE --> RESP([DraftResponse\n{results, errors}])
 ```
 
 ---
 
 ## 9. Key Design Decisions
 
-### Sequential vs. Parallel agents
-CrewAI's sequential process was chosen deliberately. Each agent's output is the next agent's input — tone analysis requires the CRM record, email drafting requires the tone score. True parallelism isn't applicable here. For independent invoices in a batch, the natural parallelisation point is at the `/draft` endpoint level (future: `asyncio.gather`).
+### Sequential vs. Parallel Agents
+CrewAI's sequential process was chosen deliberately. Each agent's output is the next agent's input — tone analysis requires the CRM record, email drafting requires the tone score. True parallelism isn't applicable within a single invoice. For batches, the natural parallelisation point is at the `/draft` endpoint level (future: `asyncio.gather` over invoices).
 
-### MCP over direct function call
-The CRM fetcher could have called `crm.fetch_client()` directly. Using MCP instead:
-- Makes the tool boundary explicit and swappable
-- Demonstrates the protocol as it would be used in production (CRM behind an MCP server)
-- Allows the MCP server to be replaced with a remote one (SSE/HTTP transport) with zero changes to the crew
+### In-Process MCP over Subprocess
+The CRM tool could have called `crm.fetch_client()` directly. Using FastMCP in-process:
+- Makes the tool boundary explicit and swappable (replace the CRM impl without touching the crew)
+- Eliminates the TTY/Abort issue caused by `crewai_tools.MCPServerAdapter` in Docker
+- The `mcp_server.py` object can still serve external callers via STDIO — no duplication
 
-### Structured JSON output with dual-parser fallback
+### Structured JSON Output with Dual-Parser Fallback
 LLMs occasionally wrap JSON in markdown code fences or add preamble text. Both Agent 2 and Agent 3 outputs go through: `json.loads()` → regex extraction → graceful default. This makes the pipeline robust to prompt formatting variance without requiring strict output parsers that throw on any deviation.
 
-### Synchronous scorers (no async)
+### Synchronous Scorers (No Async)
 The evaluation scorers are regex-based and run in microseconds. Running them synchronously in the same request thread keeps the architecture simple. The LLM-as-judge scorer is the only one with real latency cost, so it is opt-in via `LLM_JUDGE_ENABLED=true`.
 
-### In-memory task store for A2A
-The `_task_store` dict in `task_handler.py` is sufficient for a single-instance demo. For production, this would be replaced with Redis or a PostgreSQL-backed store to support multiple replicas and task persistence across restarts.
+### In-Memory Task Store for A2A
+The `_task_store` dict in `task_handler.py` is sufficient for a single-instance demo. For production, replace with Redis or a PostgreSQL-backed store to support multiple replicas and task persistence across restarts.
 
-### Partial batch success
+### Partial Batch Success
 A single bad invoice (unknown invoice number, LLM parsing failure, etc.) does not fail the entire batch. Errors are collected separately in the `errors` list so the caller gets all successfully drafted emails even if one fails.
 
 ---
@@ -451,12 +432,11 @@ A single bad invoice (unknown invoice number, LLM parsing failure, etc.) does no
 
 | Area | Current State | Production Path |
 |---|---|---|
-| CRM data | In-memory mock dict | Replace `crm.py` with real CRM API; keep MCP interface unchanged |
+| CRM data | In-memory mock dict | Replace `crm.py` with real CRM API; MCP interface stays unchanged |
 | A2A task store | In-memory dict | Redis / PostgreSQL with TTL-based eviction |
-| Concurrency | Synchronous, one invoice at a time | `asyncio.gather` over invoice batch; async CrewAI support |
-| Invoice batches | Processed serially | Parallel processing with per-invoice timeout |
+| Concurrency | Synchronous, one invoice at a time | `asyncio.gather` over invoice batch |
 | Authentication | None | OAuth2 / API key middleware on FastAPI |
 | Streaming | Not supported | Server-sent events for real-time draft streaming |
-| MCP transport | STDIO (local subprocess) | MCP over HTTP/SSE for distributed tool servers |
-| LLM | `gpt-4o-mini` hardcoded | Config-driven model selection; support for Gemini, Claude, etc. |
+| LLM | `gpt-4o-mini` hardcoded | Config-driven model selection; Claude, Gemini, Llama support |
 | Evaluation | 4 scorers | Add human-in-the-loop feedback loop to MLflow dataset |
+| MCP transport | In-process | MCP over HTTP/SSE for distributed tool servers |
