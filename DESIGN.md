@@ -38,50 +38,63 @@ Each invoice flows through a **three-agent CrewAI pipeline**. Agent 1 retrieves 
 
 ```mermaid
 flowchart TD
-    subgraph callers [Caller Layer]
-        H([HTTP Client\ncurl / Postman])
-        A([A2A Agent\nOrchestrator])
+    classDef caller  fill:#1e293b,stroke:#0f172a,color:#f8fafc
+    classDef api     fill:#1d4ed8,stroke:#1e40af,color:#fff
+    classDef agent   fill:#6d28d9,stroke:#5b21b6,color:#fff
+    classDef mcp     fill:#065f46,stroke:#064e3b,color:#fff
+    classDef eval    fill:#b45309,stroke:#92400e,color:#fff
+    classDef mlflow  fill:#4338ca,stroke:#3730a3,color:#fff
+
+    subgraph callers ["  Caller Layer  "]
+        H(["HTTP Client\ncurl / Postman"]):::caller
+        A(["A2A Agent\nOrchestrator"]):::caller
     end
 
-    subgraph api [FastAPI Service :8000]
-        EP1[GET /health]
-        EP2[GET /.well-known/agent.json\nA2A Agent Card]
-        EP3[POST /a2a\nJSON-RPC 2.0]
-        EP4[POST /draft\nBatch Processing]
+    subgraph api_sg ["  FastAPI Service :8000  "]
+        EP1["GET /health"]:::api
+        EP2["GET /.well-known/agent.json\nA2A Agent Card"]:::api
+        EP3["POST /a2a\nJSON-RPC 2.0"]:::api
+        EP4["POST /draft\nBatch Processing"]:::api
     end
 
-    subgraph crew [CrewAI Pipeline]
-        AG1[Agent 1\nCRM Fetcher]
-        AG2[Agent 2\nTone Analyzer]
-        AG3[Agent 3\nEmail Drafter]
+    subgraph crew_sg ["  CrewAI Pipeline  "]
+        AG1["Agent 1\nCRM Fetcher"]:::agent
+        AG2["Agent 2\nTone Analyzer"]:::agent
+        AG3["Agent 3\nEmail Drafter"]:::agent
         AG1 -->|client record| AG2
         AG2 -->|tone_score| AG3
     end
 
-    subgraph mcp [FastMCP Server — in-process]
-        TOOL[fetch_client_by_invoice]
-        CRM[(CRM Data\ncrm.py)]
+    subgraph mcp_sg ["  FastMCP Server — in-process  "]
+        TOOL["fetch_client_by_invoice"]:::mcp
+        CRM[("CRM Data\ncrm.py")]:::mcp
         TOOL --> CRM
     end
 
-    subgraph eval [Evaluation Pipeline]
-        S1[tone_consistency]
-        S2[completeness_*]
-        S3[guardrail_pass]
-        S4[llm_judge\noptional]
+    subgraph eval_sg ["  Evaluation Pipeline  "]
+        S1["tone_consistency"]:::eval
+        S2["completeness_*"]:::eval
+        S3["guardrail_pass"]:::eval
+        S4["llm_judge\noptional"]:::eval
     end
 
-    MLf[(MLflow\nDatabricks)]
+    MLf[("MLflow\nDatabricks")]:::mlflow
 
-    H -->|POST /draft| EP4
-    A -->|POST /a2a| EP3
+    H -->|"POST /draft"| EP4
+    A -->|"POST /a2a"| EP3
     EP3 --> EP4
     EP4 --> AG1
     AG1 <-->|FetchClientTool| TOOL
-    AG3 -->|subject + description| EP4
+    AG3 -->|"subject + description"| EP4
     EP4 --> S1 & S2 & S3 & S4
     S1 & S2 & S3 & S4 --> MLf
     EP4 -->|DraftResponse| H
+
+    style callers fill:#f1f5f9,stroke:#cbd5e1
+    style api_sg  fill:#eff6ff,stroke:#bfdbfe
+    style crew_sg fill:#f5f3ff,stroke:#ddd6fe
+    style mcp_sg  fill:#f0fdf4,stroke:#bbf7d0
+    style eval_sg fill:#fffbeb,stroke:#fde68a
 ```
 
 ---
@@ -114,17 +127,22 @@ A sequential CrewAI crew. Each agent uses `gpt-4o-mini` with `temperature=0.3` f
 
 ```mermaid
 flowchart LR
-    IN([invoice_number\ncompany_name\namount\ndue_date])
+    classDef io    fill:#1e293b,stroke:#0f172a,color:#f8fafc
+    classDef agent fill:#6d28d9,stroke:#5b21b6,color:#fff
 
-    subgraph crew [CrewAI Sequential Crew]
-        A1["Agent 1\nCRM Fetcher\n─────────────\ntool: FetchClientTool\noutput: client record JSON"]
-        A2["Agent 2\nTone Analyzer\n─────────────\ninput: client record + rubric\noutput: {tone_score, reasoning}"]
-        A3["Agent 3\nEmail Drafter\n─────────────\ninput: client record + tone_score\noutput: {subject, description}"]
+    IN(["invoice_number\ncompany_name\namount\ndue_date"]):::io
+
+    subgraph crew ["  CrewAI Sequential Crew  "]
+        A1["Agent 1 — CRM Fetcher\ntool: FetchClientTool\noutput: client record JSON"]:::agent
+        A2["Agent 2 — Tone Analyzer\ninput: client record + rubric\noutput: tone_score 0-5 + reasoning"]:::agent
+        A3["Agent 3 — Email Drafter\ninput: client record + tone_score\noutput: subject + description"]:::agent
     end
 
-    OUT([subject\ndescription\ntone_score])
+    OUT(["subject\ndescription\ntone_score"]):::io
 
     IN --> A1 --> A2 --> A3 --> OUT
+
+    style crew fill:#f5f3ff,stroke:#ddd6fe
 ```
 
 **Agent 1 — CRM Fetcher**
@@ -149,17 +167,25 @@ A **FastMCP** server object that exposes the `fetch_client_by_invoice` tool.
 
 ```mermaid
 flowchart LR
-    TOOL["FetchClientTool._run()\nin crew/email_crew.py"]
-    CLIENT["fastmcp.Client\nasync context manager"]
-    SERVER["FastMCP server object\nmcp_server.py"]
-    CRM["crm.fetch_client()\ncrm.py"]
+    classDef crew fill:#6d28d9,stroke:#5b21b6,color:#fff
+    classDef mcp  fill:#065f46,stroke:#064e3b,color:#fff
+    classDef crm  fill:#0f766e,stroke:#0d9488,color:#fff
 
-    TOOL -->|asyncio.run| CLIENT
-    CLIENT <-->|in-process\nno subprocess| SERVER
+    subgraph proc ["  Same Python Process  "]
+        TOOL["FetchClientTool._run()\ncrew/email_crew.py"]:::crew
+        CLIENT["fastmcp.Client\nasync context manager"]:::mcp
+        SERVER["FastMCP mcp object\nmcp_server.py"]:::mcp
+        CRM["crm.fetch_client()\ncrm.py"]:::crm
+    end
+
+    TOOL -->|"asyncio.run"| CLIENT
+    CLIENT <-->|"in-process call\nno subprocess"| SERVER
     SERVER --> CRM
-    CRM -->|ClientRecord dict| SERVER
-    SERVER -->|JSON string| CLIENT
-    CLIENT -->|text| TOOL
+    CRM -->|"ClientRecord dict"| SERVER
+    SERVER -->|"JSON string"| CLIENT
+    CLIENT -->|"text"| TOOL
+
+    style proc fill:#f0fdf4,stroke:#bbf7d0
 ```
 
 - Imported directly into the agent crew — no subprocess, no network port
@@ -184,7 +210,7 @@ Implements the [Google A2A specification](https://github.com/google-a2a/A2A).
 stateDiagram-v2
     [*] --> submitted : tasks/send received
     submitted --> working : processing starts
-    working --> completed : ≥1 invoice succeeded
+    working --> completed : 1 or more invoices succeeded
     working --> failed : all invoices errored
     completed --> [*]
     failed --> [*]
@@ -229,7 +255,7 @@ sequenceDiagram
     participant A3 as Agent 3<br/>Email Drafter
     participant Eval as Scorers
 
-    Caller->>API: POST /draft {invoices: [...]}
+    Caller->>API: POST /draft with invoice list
     API->>MLf: start_run("draft-batch")
     API->>MLf: start_run("draft-INV-001", nested)
 
@@ -241,18 +267,18 @@ sequenceDiagram
 
     A1-->>A2: client record (context)
     Note over A2: Applies TONE_RUBRIC<br/>against relationship_info
-    A2-->>A3: {tone_score, reasoning} (context)
+    A2-->>A3: tone_score + reasoning (context)
 
     Note over A3: Drafts email body<br/>calibrated to tone_score
-    A3-->>API: {subject, description}
+    A3-->>API: subject + description
 
     API->>Eval: run_scorers(result)
-    Eval-->>API: [{name, value, rationale}, ...]
-    API->>MLf: log_metric(tone_consistency, completeness_*, guardrail_pass)
+    Eval-->>API: name, value, rationale per scorer
+    API->>MLf: log_metric — tone_consistency, completeness, guardrail
     API->>MLf: end nested run
     API->>MLf: end parent run
 
-    API-->>Caller: DraftResponse {results, errors}
+    API-->>Caller: DraftResponse — results + errors
 ```
 
 ---
@@ -265,16 +291,22 @@ MCP provides a standardised way for LLM agents to call tools. This project uses 
 
 ```mermaid
 flowchart LR
-    subgraph crew_process [Same Python Process]
-        AGENT["CrewAI Agent\nFetchClientTool._run()"]
-        CLIENT["fastmcp.Client\n(async context manager)"]
-        SERVER["FastMCP mcp object\nmcp_server.py"]
-        CRM["crm.fetch_client()"]
+    classDef crew fill:#6d28d9,stroke:#5b21b6,color:#fff
+    classDef mcp  fill:#065f46,stroke:#064e3b,color:#fff
+    classDef crm  fill:#0f766e,stroke:#0d9488,color:#fff
+
+    subgraph proc ["  Same Python Process  "]
+        AGENT["CrewAI Agent\nFetchClientTool._run()"]:::crew
+        CLIENT["fastmcp.Client\nasync context manager"]:::mcp
+        SERVER["FastMCP mcp object\nmcp_server.py"]:::mcp
+        CRM["crm.fetch_client()"]:::crm
 
         AGENT -->|asyncio.run| CLIENT
-        CLIENT <-->|in-process call| SERVER
+        CLIENT <-->|"in-process call"| SERVER
         SERVER --> CRM
     end
+
+    style proc fill:#f0fdf4,stroke:#bbf7d0
 ```
 
 **Why in-process over subprocess?**
@@ -304,15 +336,15 @@ sequenceDiagram
 
     Note over Orch,Agent: 1. Discovery
     Orch->>Agent: GET /.well-known/agent.json
-    Agent-->>Orch: {name, description, skills, inputModes}
+    Agent-->>Orch: name, description, skills, inputModes
 
     Note over Orch,Agent: 2. Task Execution
-    Orch->>Agent: POST /a2a {jsonrpc:"2.0", method:"tasks/send", params:{...}}
-    Agent-->>Orch: {jsonrpc:"2.0", result:{id, status:{state:"completed"}, artifacts:[...]}}
+    Orch->>Agent: POST /a2a — tasks/send with invoice data
+    Agent-->>Orch: JSON-RPC result with id, status completed, artifacts
 
     Note over Orch,Agent: 3. Optional Polling
-    Orch->>Agent: POST /a2a {method:"tasks/get", params:{id:"..."}}
-    Agent-->>Orch: {result:{status, artifacts}}
+    Orch->>Agent: POST /a2a — tasks/get with task id
+    Agent-->>Orch: status + artifacts
 ```
 
 ---
@@ -331,31 +363,41 @@ LLMs are non-deterministic. Even with `temperature=0.3`, occasional outputs miss
 
 ```mermaid
 flowchart TD
-    OUT([Draft Output\ntone_score + subject + description])
+    classDef input   fill:#1e293b,stroke:#0f172a,color:#f8fafc
+    classDef scorer  fill:#b45309,stroke:#92400e,color:#fff
+    classDef check   fill:#0f766e,stroke:#0d9488,color:#fff
+    classDef pass_f  fill:#065f46,stroke:#064e3b,color:#fff
+    classDef neutral fill:#374151,stroke:#1f2937,color:#fff
+    classDef mlflow  fill:#4338ca,stroke:#3730a3,color:#fff
 
-    OUT --> T[tone_consistency_scorer]
-    OUT --> C[completeness_scorer]
-    OUT --> G[guardrail_scorer]
-    OUT --> L[_llm_judge_scorer\nonly if LLM_JUDGE_ENABLED=true]
+    OUT(["Draft Output\ntone_score + subject + description"]):::input
 
-    subgraph tone_detail [Tone Consistency Logic]
-        T --> T0{score ≤ 1?}
-        T0 -->|yes| T1[Check: final notice,\n48 hours, legal action...]
-        T0 -->|no| T2{score ≥ 4?}
-        T2 -->|yes| T3[Check: appreciate,\nvalued partner, grateful...]
-        T2 -->|no| T4[Neutral 2–3\nauto-pass]
+    OUT --> T["tone_consistency_scorer"]:::scorer
+    OUT --> C["completeness_scorer"]:::scorer
+    OUT --> G["guardrail_scorer"]:::scorer
+    OUT --> L["_llm_judge_scorer\nonly if LLM_JUDGE_ENABLED=true"]:::scorer
+
+    subgraph tone_detail ["  Tone Consistency Logic  "]
+        T --> T0{"score <= 1?"}
+        T0 -->|yes| T1["Check: final notice,\n48 hours, legal action..."]:::check
+        T0 -->|no| T2{"score >= 4?"}
+        T2 -->|yes| T3["Check: appreciate,\nvalued partner, grateful..."]:::check
+        T2 -->|no| T4["Neutral 2-3\nauto-pass"]:::neutral
     end
 
-    subgraph comp_detail [Completeness — 5 Checks]
-        C --> C1[greeting]
-        C --> C2[invoice_reference]
-        C --> C3[amount]
-        C --> C4[call_to_action]
-        C --> C5[sign_off]
-        C1 & C2 & C3 & C4 & C5 --> C6[completeness_overall]
+    subgraph comp_detail ["  Completeness — 5 Checks  "]
+        C --> C1["greeting"]:::check
+        C --> C2["invoice_reference"]:::check
+        C --> C3["amount"]:::check
+        C --> C4["call_to_action"]:::check
+        C --> C5["sign_off"]:::check
+        C1 & C2 & C3 & C4 & C5 --> C6["completeness_overall"]:::pass_f
     end
 
-    T & C6 & G & L --> MLf[(MLflow Metrics\n1.0 = pass / 0.0 = fail)]
+    T & C6 & G & L --> MLf[("MLflow Metrics\n1.0 = pass / 0.0 = fail")]:::mlflow
+
+    style tone_detail fill:#fffbeb,stroke:#fde68a
+    style comp_detail fill:#f0fdf4,stroke:#bbf7d0
 ```
 
 ### MLflow Metric Schema
@@ -380,25 +422,34 @@ llm_judge_professional_tone       0.0–1.0  (optional)
 
 ```mermaid
 flowchart TD
-    REQ([POST /draft\n{invoice_number, company_name, amount, due_date}])
+    classDef entry   fill:#1e293b,stroke:#0f172a,color:#f8fafc
+    classDef api     fill:#1d4ed8,stroke:#1e40af,color:#fff
+    classDef mlflow  fill:#4338ca,stroke:#3730a3,color:#fff
+    classDef agent   fill:#6d28d9,stroke:#5b21b6,color:#fff
+    classDef parse   fill:#374151,stroke:#1f2937,color:#fff
+    classDef eval    fill:#b45309,stroke:#92400e,color:#fff
 
-    REQ --> VAL[Pydantic Validation]
-    VAL --> PR[MLflow parent run\ndraft-batch]
-    PR --> NR[MLflow nested run\ndraft-invoice_number]
+    REQ(["POST /draft\ninvoice_number, company_name, amount, due_date"]):::entry
 
-    NR --> INV[run_for_invoice]
+    REQ --> VAL["Pydantic Validation"]:::api
+    VAL --> PR["MLflow parent run\ndraft-batch"]:::mlflow
+    PR --> NR["MLflow nested run\ndraft-invoice_number"]:::mlflow
 
-    subgraph pipeline [CrewAI Pipeline]
-        INV --> F[Agent 1: fetch_client_by_invoice\nvia FastMCP in-process]
-        F --> T[Agent 2: apply TONE_RUBRIC\nLLM → tone_score 0-5]
-        T --> D[Agent 3: draft email\nLLM → subject + description]
+    NR --> INV["run_for_invoice"]:::api
+
+    subgraph pipeline ["  CrewAI Pipeline  "]
+        INV --> F["Agent 1 — CRM Fetcher\nfetch_client_by_invoice via FastMCP"]:::agent
+        F --> T["Agent 2 — Tone Analyzer\napply TONE_RUBRIC — tone_score 0-5"]:::agent
+        T --> D["Agent 3 — Email Drafter\ndraft subject + description"]:::agent
     end
 
-    D --> PARSE[Parse output JSON\nfallback: regex]
-    PARSE --> SCORE[run_scorers\ntone + completeness + guardrail]
-    SCORE --> LOG[log_scores_to_mlflow]
-    LOG --> CLOSE[Close nested run\nClose parent run]
-    CLOSE --> RESP([DraftResponse\n{results, errors}])
+    D --> PARSE["Parse output JSON\nfallback: regex"]:::parse
+    PARSE --> SCORE["run_scorers\ntone + completeness + guardrail"]:::eval
+    SCORE --> LOG["log_scores_to_mlflow"]:::mlflow
+    LOG --> CLOSE["Close nested run\nClose parent run"]:::mlflow
+    CLOSE --> RESP(["DraftResponse\nresults + errors"]):::entry
+
+    style pipeline fill:#f5f3ff,stroke:#ddd6fe
 ```
 
 ---
