@@ -1,17 +1,41 @@
 # Cash Collection Email Drafter
 
-A production-ready **multi-agent AI service** that automates accounts-receivable outreach. Given a batch of overdue invoices, it fetches live CRM data, decides the right communication tone per client relationship, drafts a tailored collection email, evaluates it through a quality pipeline, and logs every metric to MLflow — all in a single API call.
+> A production-ready multi-agent AI service that automates accounts-receivable outreach. Given a batch of overdue invoices, it fetches live CRM data, decides the right tone per client relationship, drafts a tailored collection email, evaluates it through a quality pipeline, and logs every metric to MLflow — all in a single API call.
+
+[![Python](https://img.shields.io/badge/Python-3.11+-blue)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-green)](https://fastapi.tiangolo.com/)
+[![CrewAI](https://img.shields.io/badge/CrewAI-0.95+-orange)](https://github.com/crewAIInc/crewAI)
+[![MLflow](https://img.shields.io/badge/MLflow-2.21+-red)](https://mlflow.org/)
 
 ---
 
-## Why This Exists
+## The Problem It Solves
 
-Writing collection emails is tedious, error-prone, and relationship-sensitive. Blasting every overdue client with the same firm reminder alienates high-value partners; being too polite with serial defaulters sends the wrong signal. This service solves that by:
+Writing collection emails manually is tedious, error-prone, and relationship-sensitive:
 
-- Reading client history from a CRM tool
-- Running it through a structured **tone rubric (0 = firm → 5 = polite)**
-- Generating a contextually appropriate email
-- Automatically scoring it for quality before it ever reaches a human
+- **Too firm with a high-value partner?** You damage a long-term relationship.
+- **Too polite with a serial defaulter?** You send the wrong signal entirely.
+
+This service solves that by reading each client's CRM history, running it through a structured tone rubric, and generating a contextually calibrated email automatically — then scoring it before it ever reaches a human.
+
+---
+
+## How It Works
+
+```
+  POST /draft  ──►  CrewAI Crew  ──►  FastMCP CRM Server  ──►  MLflow
+                    (3 Agents)         (in-process)              (metrics)
+```
+
+**Three agents run in sequence:**
+
+| # | Agent | What it does |
+|---|---|---|
+| 1 | CRM Fetcher | Calls the MCP tool to retrieve the client record for the invoice |
+| 2 | Tone Analyzer | Reads the client's relationship history and assigns a tone score (0–5) |
+| 3 | Email Drafter | Drafts a subject line + full email body calibrated to that tone score |
+
+Every drafted email is then passed through an evaluation pipeline and all metrics are logged to MLflow.
 
 ---
 
@@ -21,47 +45,13 @@ Writing collection emails is tedious, error-prone, and relationship-sensitive. B
 |---|---|
 | Agent Framework | [CrewAI](https://github.com/crewAIInc/crewAI) |
 | LLM | OpenAI `gpt-4o-mini` |
-| Tool Protocol | [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) — STDIO transport |
+| Tool Protocol | [FastMCP](https://github.com/jlowin/fastmcp) — in-process MCP server |
 | Agent Interop | [Google A2A Protocol](https://github.com/google-a2a/A2A) — JSON-RPC 2.0 |
 | API | FastAPI + Uvicorn |
 | Evaluation | MLflow custom scorers + optional LLM-as-judge |
 | Experiment Tracking | MLflow → Databricks |
 | Containerisation | Docker + Docker Compose |
 | Language | Python 3.11+ |
-
----
-
-## Architecture at a Glance
-
-```
-                        ┌─────────────────────────────────┐
-  Caller / A2A Agent ──►│         FastAPI  :8000          │
-                        │  /draft   /a2a   /agent.json    │
-                        └──────────────┬──────────────────┘
-                                       │
-                        ┌──────────────▼──────────────────┐
-                        │        CrewAI  Crew              │
-                        │  ┌──────────┐  ┌─────────────┐  │
-                        │  │  Agent 1 │  │   Agent 2   │  │
-                        │  │   CRM    │  │    Tone     │  │
-                        │  │ Fetcher  │  │  Analyzer   │  │
-                        │  └────┬─────┘  └──────┬──────┘  │
-                        │       │ MCP            │         │
-                        │  ┌────▼─────┐  ┌──────▼──────┐  │
-                        │  │   MCP    │  │   Agent 3   │  │
-                        │  │  Server  │  │    Email    │  │
-                        │  │ (STDIO)  │  │   Drafter   │  │
-                        │  └────┬─────┘  └──────┬──────┘  │
-                        │       │               │          │
-                        └───────┼───────────────┼──────────┘
-                                │               │
-                          ┌─────▼────┐   ┌──────▼──────────┐
-                          │  CRM DB  │   │    Scorers +    │
-                          │ (mock)   │   │  MLflow / DBKS  │
-                          └──────────┘   └─────────────────┘
-```
-
-> See [DESIGN.md](DESIGN.md) for the full design document with detailed data-flow diagrams and protocol walkthroughs.
 
 ---
 
@@ -86,7 +76,7 @@ docker compose up --build
 
 The service starts on `http://localhost:8000`. The first build takes a few minutes to install all dependencies.
 
-### 3. Health check
+### 3. Verify it's running
 
 ```bash
 curl http://localhost:8000/health
@@ -95,55 +85,24 @@ curl http://localhost:8000/health
 
 ---
 
-## Local Development (without Docker)
-
-**Prerequisites:** Python 3.11+
-
-```bash
-# 1. Clone
-git clone https://github.com/Avii3301/cashCollection-A2A.git
-cd cashCollection-A2A
-
-# 2. Create and activate a virtual environment
-python3.11 -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-
-# 3. Install dependencies
-pip install -e .
-
-# 4. Configure environment
-cp .env.example .env
-# Edit .env — fill in OPENAI_API_KEY and Databricks credentials
-# To skip Databricks entirely, set:
-#   MLFLOW_TRACKING_URI=http://127.0.0.1:5000
-# and run:  mlflow server --port 5000
-
-# 5. Run
-uvicorn app:app --reload --port 8000
-```
-
-The service is now live at `http://localhost:8000`.
-
-> **Note:** The MCP server (`mcp_server.py`) is loaded in-process by the crew — no subprocess or separate process needed.
-
----
-
 ## Interactive API Docs
 
 Once the service is running, open **[http://localhost:8000/docs](http://localhost:8000/docs)** in your browser.
 
-You get a full Swagger UI with pre-filled examples — hit **Try it out** on any endpoint and click **Execute**. No Postman or curl needed.
+You get a full Swagger UI with **pre-filled examples** — hit **Try it out** on any endpoint and click **Execute**. No Postman or curl setup needed.
 
-| UI | URL |
+| Interface | URL |
 |---|---|
-| Swagger UI | `http://localhost:8000/docs` |
-| ReDoc | `http://localhost:8000/redoc` |
+| Swagger UI (interactive) | `http://localhost:8000/docs` |
+| ReDoc (reference) | `http://localhost:8000/redoc` |
 
 ---
 
 ## API Reference
 
-### `POST /draft` — Direct batch processing
+### `POST /draft` — Batch invoice processing
+
+Send a list of invoices and get back a drafted collection email for each one.
 
 ```bash
 curl -X POST http://localhost:8000/draft \
@@ -188,8 +147,8 @@ curl -X POST http://localhost:8000/draft \
 }
 ```
 
-> **INV-001** (multiple past defaults) gets tone 0 — firm, consequences stated.
-> **INV-006** (high-value client) gets tone 5 — warm, relationship-first.
+> **INV-001** has multiple past defaults → tone score **0** (firm, consequences stated).
+> **INV-006** is a high-value client → tone score **5** (warm, relationship-first).
 
 ---
 
@@ -224,7 +183,7 @@ curl -X POST http://localhost:8000/a2a \
 
 ### `GET /.well-known/agent.json` — A2A Agent Card
 
-Describes this agent's capabilities, skills, and input/output schemas per the A2A spec.
+Returns this agent's capability descriptor per the A2A spec — used by orchestrators for skill discovery.
 
 ```bash
 curl http://localhost:8000/.well-known/agent.json
@@ -234,36 +193,67 @@ curl http://localhost:8000/.well-known/agent.json
 
 ## Environment Variables
 
+Create a `.env` file in the project root (copy from `.env.example`):
+
 | Variable | Required | Description |
 |---|---|---|
-| `OPENAI_API_KEY` | Yes | OpenAI API key (`sk-...`) |
+| `OPENAI_API_KEY` | **Yes** | OpenAI API key (`sk-...`) |
 | `DATABRICKS_HOST` | Yes* | Databricks workspace URL |
 | `DATABRICKS_TOKEN` | Yes* | Databricks personal access token |
 | `MLFLOW_TRACKING_URI` | No | `databricks` or `http://127.0.0.1:5000` (default: `databricks`) |
-| `MLFLOW_EXPERIMENT_NAME` | No | MLflow experiment path (default: `cash-collection-drafter`) |
+| `MLFLOW_EXPERIMENT_NAME` | No | MLflow experiment path (default: `/Shared/cash-collection-drafter`) |
 | `BASE_URL` | No | Public URL of this service (default: `http://localhost:8000`) |
 | `LLM_JUDGE_ENABLED` | No | `true` to enable LLM-as-judge scorer (uses extra OpenAI credits) |
 
-\* Required if `MLFLOW_TRACKING_URI=databricks`. Set `MLFLOW_TRACKING_URI=http://127.0.0.1:5000` to use a local MLflow server with no Databricks dependency.
+> \* Required only when `MLFLOW_TRACKING_URI=databricks`.
+> To run without Databricks: set `MLFLOW_TRACKING_URI=http://127.0.0.1:5000` and run `mlflow server --port 5000` locally.
+
+---
+
+## Local Development (without Docker)
+
+**Prerequisites:** Python 3.11+
+
+```bash
+# 1. Clone
+git clone https://github.com/Avii3301/cashCollection-A2A.git
+cd cashCollection-A2A
+
+# 2. Create a virtual environment
+python3.11 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+
+# 3. Install dependencies
+pip install -e .
+
+# 4. Configure environment
+cp .env.example .env
+# Edit .env with your keys
+
+# 5. Run
+uvicorn app:app --reload --port 8000
+```
+
+> **Note:** The MCP server (`mcp_server.py`) is loaded in-process by the crew — no subprocess or separate process needed.
 
 ---
 
 ## Project Structure
 
 ```
-cash-collection-a2a/
+cashCollection-A2A/
 │
 ├── app.py                  # FastAPI application — endpoints & MLflow setup
-├── crm.py                  # Mock CRM data store (8 records, all tone tiers)
-├── mcp_server.py           # MCP STDIO server — exposes fetch_client_by_invoice tool
+├── crm.py                  # Mock CRM data store (8 client records)
+├── mcp_server.py           # FastMCP server — exposes fetch_client_by_invoice tool
 │
 ├── crew/
 │   ├── email_crew.py       # Three-agent CrewAI pipeline
-│   └── tone_rubric.py      # Tone scoring rubric (0-5 scale, with decision guide)
+│   └── tone_rubric.py      # Tone scoring rubric (0–5 scale)
 │
 ├── a2a/
-│   ├── agent_card.py       # A2A Agent Card builder (/.well-known/agent.json)
-│   └── task_handler.py     # JSON-RPC 2.0 dispatcher — tasks/send, tasks/get
+│   ├── agent_card.py       # A2A Agent Card builder
+│   └── task_handler.py     # JSON-RPC 2.0 dispatcher
 │
 ├── evaluation/
 │   └── scorers.py          # tone_consistency, completeness, guardrail, llm_judge
@@ -277,18 +267,18 @@ cash-collection-a2a/
 
 ---
 
-## Evaluation Pipeline
+## Tone Scale Reference
 
-Every drafted email is automatically evaluated by four scorers before the response is returned:
+The tone analyzer assigns each email a score from 0 to 5 based on the client's payment history and relationship value:
 
-| Scorer | Type | What it checks |
+| Score | Style | When it's used |
 |---|---|---|
-| `tone_consistency` | Rule-based | Firm language in score 0-1 emails; polite markers in score 4-5 |
-| `completeness_*` | Rule-based | Greeting, invoice reference, amount, call-to-action, sign-off |
-| `guardrail_pass` | Rule-based | No offensive, threatening, or abusive content |
-| `llm_judge_professional_tone` | LLM-as-judge | Holistic tone appropriateness via MLflow Guidelines scorer |
-
-All metrics are logged to MLflow as numeric values (1.0 = pass, 0.0 = fail) for trend analysis and experiment comparison.
+| **0** | Firm / strict | Multiple defaults, high overdue amount — states consequences, 48-hour deadline |
+| **1** | Assertive | Repeat late payer — clear language, firm deadline |
+| **2** | Direct | No payment history, overdue — factual, no softening |
+| **3** | Neutral | Standard client — professional, balanced |
+| **4** | Courteous | New or occasional client — polite, assuming good faith |
+| **5** | Warm / polite | High-value or long-term partner — relationship-first, appreciative |
 
 ---
 
@@ -303,12 +293,27 @@ The mock CRM covers all tone tiers out of the box:
 | INV-003 | Crestwood Manufacturing | Overdue, no history | 2 — Direct |
 | INV-004 | Harborview Consulting | Standard client | 3 — Neutral |
 | INV-005 | Apex Innovations Inc | New client | 4 — Courteous |
-| INV-006 | Sterling Global Partners | High value client | 5 — Polite |
-| INV-007 | Evergreen Tech Solutions | Long-term client | 5 — Polite |
+| INV-006 | Sterling Global Partners | High-value client | 5 — Warm |
+| INV-007 | Evergreen Tech Solutions | Long-term client | 5 — Warm |
 | INV-008 | Cascade Digital Services | Overdue, no history | 2 — Direct |
+
+---
+
+## Evaluation Pipeline
+
+Every drafted email is automatically evaluated before the response is returned:
+
+| Scorer | Type | What it checks |
+|---|---|---|
+| `tone_consistency` | Rule-based | Firm language in low-score emails; polite markers in high-score emails |
+| `completeness_*` | Rule-based | Greeting, invoice reference, amount, call-to-action, sign-off all present |
+| `guardrail_pass` | Rule-based | No offensive, threatening, or abusive content |
+| `llm_judge_professional_tone` | LLM-as-judge | Holistic tone appropriateness (optional, requires `LLM_JUDGE_ENABLED=true`) |
+
+All metrics are logged to MLflow as `1.0` (pass) or `0.0` (fail) for trend analysis and experiment comparison.
 
 ---
 
 ## Design & Architecture
 
-For protocol walkthroughs, agent interaction diagrams, evaluation pipeline design, and architectural trade-offs, see **[DESIGN.md](DESIGN.md)**.
+For protocol walkthroughs, agent interaction diagrams, evaluation pipeline design, and architectural decisions, see **[DESIGN.md](DESIGN.md)**.
