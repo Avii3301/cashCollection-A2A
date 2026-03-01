@@ -72,8 +72,10 @@ class TestExtractToneScore:
             assert _extract_tone_score(output) == score
 
     def test_regex_fallback_when_json_malformed(self):
-        """If JSON is broken, falls back to regex search for tone_score."""
-        output = FakeTaskOutput('The tone_score: 2 seems appropriate for this client.')
+        """If JSON is broken, falls back to regex search for tone_score.
+        The regex matches the pattern "tone_score": <digit> (with double quotes).
+        """
+        output = FakeTaskOutput('Based on the data: "tone_score": 2, this seems right.')
         assert _extract_tone_score(output) == 2
 
     def test_regex_fallback_with_quotes(self):

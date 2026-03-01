@@ -14,7 +14,6 @@ venv/
 env/
 
 # IDE
-.vscode/settings.json
 .idea/
 
 # macOS
