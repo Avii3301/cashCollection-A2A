@@ -20,22 +20,61 @@ This service solves that by reading each client's CRM history, running it throug
 
 ---
 
-## How It Works
+## System Architecture
 
+```mermaid
+flowchart TD
+    A([Client / A2A Agent]) -->|POST /draft\nor POST /a2a| B[FastAPI :8000]
+
+    B --> C[CrewAI Crew\nsequential process]
+
+    subgraph crew [Three-Agent Pipeline]
+        direction TB
+        C --> D[Agent 1\nCRM Fetcher]
+        D --> E[Agent 2\nTone Analyzer]
+        E --> F[Agent 3\nEmail Drafter]
+    end
+
+    D <-->|FetchClientTool\nin-process| G[FastMCP Server]
+    G --> H[(CRM Data Store)]
+
+    F --> I[Evaluation\nPipeline]
+    I -->|tone_consistency\ncompleteness_*\nguardrail_pass| J[(MLflow\nDatabricks)]
+
+    F -->|subject +\ndescription| B
+    B -->|DraftResponse| A
 ```
-  POST /draft  ──►  CrewAI Crew  ──►  FastMCP CRM Server  ──►  MLflow
-                    (3 Agents)         (in-process)              (metrics)
+
+---
+
+## Agent Workflow
+
+```mermaid
+sequenceDiagram
+    actor API as POST /draft
+    participant A1 as Agent 1<br/>CRM Fetcher
+    participant MCP as FastMCP Server<br/>(in-process)
+    participant CRM as CRM Store
+    participant A2 as Agent 2<br/>Tone Analyzer
+    participant A3 as Agent 3<br/>Email Drafter
+    participant MLf as MLflow
+
+    API->>A1: invoice_number, company, amount, due_date
+    A1->>MCP: fetch_client_by_invoice(invoice_number)
+    MCP->>CRM: lookup(invoice_number)
+    CRM-->>MCP: ClientRecord
+    MCP-->>A1: client JSON (name, email, relationship_info, amount, due_date)
+
+    A1-->>A2: client record (context)
+    Note over A2: Applies tone rubric<br/>against relationship_info
+    A2-->>A3: tone_score 0–5 + reasoning (context)
+
+    Note over A3: Drafts email calibrated<br/>to tone score
+    A3-->>API: {"subject": "...", "description": "..."}
+
+    API->>MLf: log params + tone_score
+    API->>MLf: log metrics (completeness, guardrail, tone_consistency)
 ```
-
-**Three agents run in sequence:**
-
-| # | Agent | What it does |
-|---|---|---|
-| 1 | CRM Fetcher | Calls the MCP tool to retrieve the client record for the invoice |
-| 2 | Tone Analyzer | Reads the client's relationship history and assigns a tone score (0–5) |
-| 3 | Email Drafter | Drafts a subject line + full email body calibrated to that tone score |
-
-Every drafted email is then passed through an evaluation pipeline and all metrics are logged to MLflow.
 
 ---
 
@@ -48,7 +87,7 @@ Every drafted email is then passed through an evaluation pipeline and all metric
 | Tool Protocol | [FastMCP](https://github.com/jlowin/fastmcp) — in-process MCP server |
 | Agent Interop | [Google A2A Protocol](https://github.com/google-a2a/A2A) — JSON-RPC 2.0 |
 | API | FastAPI + Uvicorn |
-| Evaluation | MLflow custom scorers + optional LLM-as-judge |
+| Evaluation | Rule-based scorers + optional LLM-as-judge |
 | Experiment Tracking | MLflow → Databricks |
 | Containerisation | Docker + Docker Compose |
 | Language | Python 3.11+ |
@@ -191,6 +230,55 @@ curl http://localhost:8000/.well-known/agent.json
 
 ---
 
+## Evaluation Pipeline
+
+Every drafted email is automatically evaluated before the response is returned. Results are logged to MLflow as `1.0` (pass) or `0.0` (fail).
+
+```mermaid
+flowchart LR
+    OUT([Email Draft\ntone_score + description])
+
+    OUT --> T[Tone Consistency\nScorer]
+    OUT --> C[Completeness\nScorer]
+    OUT --> G[Guardrail\nScorer]
+    OUT --> L[LLM-as-Judge\noptional]
+
+    T --> M[(MLflow\nMetrics)]
+    C --> M
+    G --> M
+    L --> M
+
+    subgraph tone_check [Tone Consistency]
+        T --> T1{tone_score ≤ 1?}
+        T1 -->|yes| T2[Check firm markers\nfinal notice, 48h deadline...]
+        T1 -->|no| T3{tone_score ≥ 4?}
+        T3 -->|yes| T4[Check polite markers\nappreciate, valued partner...]
+        T3 -->|no| T5[Neutral range\n2–3, auto-pass]
+    end
+
+    subgraph completeness [Completeness — 5 checks]
+        C --> C1[greeting]
+        C --> C2[invoice_reference]
+        C --> C3[amount]
+        C --> C4[call_to_action]
+        C --> C5[sign_off]
+    end
+```
+
+| Metric | Type | What it checks |
+|---|---|---|
+| `tone_consistency` | Rule-based | Firm language in score 0–1 emails; polite markers in score 4–5 |
+| `completeness_greeting` | Rule-based | "Dear", "Hello", "Hi" present |
+| `completeness_invoice_reference` | Rule-based | Invoice number mentioned in the body |
+| `completeness_amount` | Rule-based | Dollar amount or outstanding balance referenced |
+| `completeness_call_to_action` | Rule-based | Payment instruction or deadline present |
+| `completeness_sign_off` | Rule-based | "Regards", "Sincerely", "Thank you" present |
+| `completeness_overall` | Rule-based | All 5 completeness checks passed |
+| `guardrail_pass` | Rule-based | No offensive, threatening, or abusive content detected |
+| `llm_judge_professional_tone` | LLM-as-judge | Holistic tone review (set `LLM_JUDGE_ENABLED=true` to enable) |
+
+---
+
 ## Environment Variables
 
 Create a `.env` file in the project root (copy from `.env.example`):
@@ -238,42 +326,32 @@ uvicorn app:app --reload --port 8000
 
 ---
 
-## Project Structure
-
-```
-cashCollection-A2A/
-│
-├── app.py                  # FastAPI application — endpoints & MLflow setup
-├── crm.py                  # Mock CRM data store (8 client records)
-├── mcp_server.py           # FastMCP server — exposes fetch_client_by_invoice tool
-│
-├── crew/
-│   ├── email_crew.py       # Three-agent CrewAI pipeline
-│   └── tone_rubric.py      # Tone scoring rubric (0–5 scale)
-│
-├── a2a/
-│   ├── agent_card.py       # A2A Agent Card builder
-│   └── task_handler.py     # JSON-RPC 2.0 dispatcher
-│
-├── evaluation/
-│   └── scorers.py          # tone_consistency, completeness, guardrail, llm_judge
-│
-├── Dockerfile
-├── docker-compose.yml
-├── pyproject.toml
-├── .env.example
-└── DESIGN.md               # Full system design document
-```
-
----
-
 ## Tone Scale Reference
 
 The tone analyzer assigns each email a score from 0 to 5 based on the client's payment history and relationship value:
 
+```mermaid
+graph LR
+    T0["0 — Firm\n48h deadline\nstate consequences"]
+    T1["1 — Assertive\nclear deadline\nfirm language"]
+    T2["2 — Direct\nfactual\nno softening"]
+    T3["3 — Neutral\nprofessional\nbalanced"]
+    T4["4 — Courteous\ngood faith\npolite"]
+    T5["5 — Warm\nrelationship-first\nappreciative"]
+
+    T0 --- T1 --- T2 --- T3 --- T4 --- T5
+
+    style T0 fill:#ff4444,color:#fff
+    style T1 fill:#ff7744,color:#fff
+    style T2 fill:#ffaa44,color:#000
+    style T3 fill:#ffdd44,color:#000
+    style T4 fill:#88cc44,color:#000
+    style T5 fill:#44aa44,color:#fff
+```
+
 | Score | Style | When it's used |
 |---|---|---|
-| **0** | Firm / strict | Multiple defaults, high overdue amount — states consequences, 48-hour deadline |
+| **0** | Firm / strict | Multiple defaults — states consequences, 48-hour deadline |
 | **1** | Assertive | Repeat late payer — clear language, firm deadline |
 | **2** | Direct | No payment history, overdue — factual, no softening |
 | **3** | Neutral | Standard client — professional, balanced |
@@ -299,18 +377,32 @@ The mock CRM covers all tone tiers out of the box:
 
 ---
 
-## Evaluation Pipeline
+## Project Structure
 
-Every drafted email is automatically evaluated before the response is returned:
-
-| Scorer | Type | What it checks |
-|---|---|---|
-| `tone_consistency` | Rule-based | Firm language in low-score emails; polite markers in high-score emails |
-| `completeness_*` | Rule-based | Greeting, invoice reference, amount, call-to-action, sign-off all present |
-| `guardrail_pass` | Rule-based | No offensive, threatening, or abusive content |
-| `llm_judge_professional_tone` | LLM-as-judge | Holistic tone appropriateness (optional, requires `LLM_JUDGE_ENABLED=true`) |
-
-All metrics are logged to MLflow as `1.0` (pass) or `0.0` (fail) for trend analysis and experiment comparison.
+```
+cashCollection-A2A/
+│
+├── app.py                  # FastAPI application — endpoints & MLflow setup
+├── crm.py                  # Mock CRM data store (8 client records)
+├── mcp_server.py           # FastMCP server — exposes fetch_client_by_invoice tool
+│
+├── crew/
+│   ├── email_crew.py       # Three-agent CrewAI pipeline
+│   └── tone_rubric.py      # Tone scoring rubric (0–5 scale)
+│
+├── a2a/
+│   ├── agent_card.py       # A2A Agent Card builder
+│   └── task_handler.py     # JSON-RPC 2.0 dispatcher
+│
+├── evaluation/
+│   └── scorers.py          # tone_consistency, completeness, guardrail, llm_judge
+│
+├── Dockerfile
+├── docker-compose.yml
+├── pyproject.toml
+├── .env.example            # Copy to .env and fill in your keys
+└── DESIGN.md               # Full system design document
+```
 
 ---
 
