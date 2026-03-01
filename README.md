@@ -72,8 +72,8 @@ Writing collection emails is tedious, error-prone, and relationship-sensitive. B
 ### 1. Clone and configure
 
 ```bash
-git clone <repo-url>
-cd cash-collection-a2a
+git clone https://github.com/Avii3301/cashCollection-A2A.git
+cd cashCollection-A2A
 cp .env.example .env
 # Fill in your keys in .env
 ```
@@ -101,8 +101,8 @@ curl http://localhost:8000/health
 
 ```bash
 # 1. Clone
-git clone <repo-url>
-cd cash-collection-a2a
+git clone https://github.com/Avii3301/cashCollection-A2A.git
+cd cashCollection-A2A
 
 # 2. Create and activate a virtual environment
 python3.11 -m venv .venv
@@ -124,7 +124,7 @@ uvicorn app:app --reload --port 8000
 
 The service is now live at `http://localhost:8000`.
 
-> **Note:** The MCP server (`mcp_server.py`) is launched automatically as a subprocess by the crew when a request arrives — you do not need to start it separately.
+> **Note:** The MCP server (`mcp_server.py`) is loaded in-process by the crew — no subprocess or separate process needed.
 
 ---
 
